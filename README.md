@@ -59,4 +59,4 @@ This plugin is open-source software licensed under the [GPL v2 or later](https:/
 
 ---
 
-For more information or questions, please visit the plugin author’s website: [Your Site](https://your-site.com)
+For more information or questions, please visit the plugin author’s website: https://rd5.com.br/dev
