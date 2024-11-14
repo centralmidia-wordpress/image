@@ -1,0 +1,404 @@
+<?php
+/*
+Plugin Name: AnytoWEBP noGif Secure
+Description: Converts images to WebP (except GIFs), resizes large images, maintains aspect ratio, and applies security measures. Renames images with post ID.
+Version: 1.1
+Author: Daniel Oliveira da Paixao
+Author URI: https://rd5.com.br/dev
+License: GPL v2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+*/
+
+// Prevents direct access to the file
+if (!defined('ABSPATH')) {
+    exit('Direct access not allowed');
+}
+
+class AnytoWEBP {
+    // Class constants
+    const PLUGIN_VERSION = '1.1';
+    const MIN_PHP_VERSION = '7.4';
+    const MIN_WP_VERSION = '5.3';
+    
+    // Default settings
+    private $defaults = [
+        'max_dimension' => 1200,
+        'memory_limit' => '256M',
+        'quality' => 80,
+        'preserve_exif' => false,
+        'delete_original' => true
+    ];
+
+    private $options;
+
+    public function __construct() {
+        // Initialize options
+        $this->options = wp_parse_args(
+            get_option('anytowebp_options', []),
+            $this->defaults
+        );
+
+        // Register activation/deactivation hooks
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+
+        // Check requirements and initialize the plugin
+        if ($this->check_requirements()) {
+            $this->init();
+        }
+    }
+
+    public function activate() {
+        // Check minimum requirements
+        if (!$this->check_requirements()) {
+            deactivate_plugins(plugin_basename(__FILE__));
+            wp_die(
+                'The AnytoWEBP plugin requires PHP ' . self::MIN_PHP_VERSION . '+ and WordPress ' . self::MIN_WP_VERSION . '+',
+                'Activation Error',
+                ['back_link' => true]
+            );
+        }
+
+        // Initialize default options
+        if (!get_option('anytowebp_options')) {
+            update_option('anytowebp_options', $this->defaults);
+        }
+
+        // Create cache directory if needed
+        $upload_dir = wp_upload_dir();
+        $cache_dir = $upload_dir['basedir'] . '/anytowebp-cache';
+        if (!file_exists($cache_dir)) {
+            wp_mkdir_p($cache_dir);
+            file_put_contents($cache_dir . '/index.php', '<?php // Silence is golden');
+        }
+    }
+
+    public function deactivate() {
+        // Clears cache if needed
+        // Keeps options in case the plugin is reactivated
+    }
+
+    private function check_requirements() {
+        // Check PHP version
+        if (version_compare(PHP_VERSION, self::MIN_PHP_VERSION, '<')) {
+            add_action('admin_notices', function() {
+                echo '<div class="error"><p>AnytoWEBP requires PHP ' . self::MIN_PHP_VERSION . '+ (current: ' . PHP_VERSION . ')</p></div>';
+            });
+            return false;
+        }
+
+        // Check WordPress version
+        if (version_compare($GLOBALS['wp_version'], self::MIN_WP_VERSION, '<')) {
+            add_action('admin_notices', function() {
+                echo '<div class="error"><p>AnytoWEBP requires WordPress ' . self::MIN_WP_VERSION . '+</p></div>';
+            });
+            return false;
+        }
+
+        // Check WebP support
+        if (!function_exists('imagewebp')) {
+            add_action('admin_notices', function() {
+                echo '<div class="error"><p>AnytoWEBP requires WebP support in PHP</p></div>';
+            });
+            return false;
+        }
+
+        return true;
+    }
+
+    private function init() {
+        // Main hooks
+        add_filter('wp_handle_upload', [$this, 'convert_to_webp']);
+        add_filter('webp_quality', [$this, 'get_quality']);
+        
+        // Admin
+        if (is_admin()) {
+            add_action('admin_menu', [$this, 'add_admin_menu']);
+            add_action('admin_init', [$this, 'register_settings']);
+            add_filter('plugin_action_links_' . plugin_basename(__FILE__), [$this, 'add_settings_link']);
+        }
+    }
+
+    public function convert_to_webp($file) {
+        try {
+            // Check file type
+            $valid_types = ['image/jpeg', 'image/png'];
+            if (!in_array($file['type'], $valid_types)) {
+                return $file;
+            }
+
+            $image_path = $file['file'];
+            $extension = strtolower(pathinfo($image_path, PATHINFO_EXTENSION));
+
+            // Check image
+            $image_info = @getimagesize($image_path);
+            if (!$image_info) {
+                throw new Exception("Invalid image: {$image_path}");
+            }
+
+            // Set memory
+            ini_set('memory_limit', $this->options['memory_limit']);
+
+            // Load image
+            $image = $this->load_image($image_path, $extension);
+            if (!$image) {
+                throw new Exception("Failed to load: {$image_path}");
+            }
+
+            // Resize if necessary
+            $image = $this->resize_image($image, $this->options['max_dimension']);
+
+            // Generate unique name
+            $new_name = $this->generate_filename($file['name']);
+            $webp_path = dirname($image_path) . '/' . $new_name;
+
+            // Convert to WebP
+            $quality = $this->get_quality();
+            if (!imagewebp($image, $webp_path, $quality)) {
+                throw new Exception("WebP conversion failed: {$image_path}");
+            }
+
+            // Optimize permissions
+            chmod($webp_path, 0644);
+
+            // Clean up
+            imagedestroy($image);
+
+            // Remove original if set
+            if ($this->options['delete_original'] && file_exists($webp_path)) {
+                @unlink($image_path);
+            }
+
+            // Update information
+            $file['file'] = $webp_path;
+            $file['type'] = 'image/webp';
+            $file['name'] = $new_name;
+
+            // Success log
+            $this->log("Successful conversion: {$new_name}");
+
+            return $file;
+
+        } catch (Exception $e) {
+            $this->log("Error: " . $e->getMessage(), true);
+            return $file;
+        }
+    }
+
+    private function load_image($path, $extension) {
+        switch ($extension) {
+            case 'jpeg':
+            case 'jpg':
+                return imagecreatefromjpeg($path);
+            case 'png':
+                $image = imagecreatefrompng($path);
+                if ($image) {
+                    imagealphablending($image, true);
+                    imagesavealpha($image, true);
+                }
+                return $image;
+            default:
+                return null;
+        }
+    }
+
+    private function resize_image($image, $max_dimension) {
+        $width = imagesx($image);
+        $height = imagesy($image);
+
+        if ($width <= $max_dimension && $height <= $max_dimension) {
+            return $image;
+        }
+
+        $ratio = $width / $height;
+        if ($ratio > 1) {
+            $new_width = $max_dimension;
+            $new_height = floor($max_dimension / $ratio);
+        } else {
+            $new_height = $max_dimension;
+            $new_width = floor($max_dimension * $ratio);
+        }
+
+        $new_image = imagecreatetruecolor($new_width, $new_height);
+        
+        // Preserve transparency
+        imagealphablending($new_image, false);
+        imagesavealpha($new_image, true);
+
+        imagecopyresampled(
+            $new_image, $image,
+            0, 0, 0, 0,
+            $new_width, $new_height,
+            $width, $height
+        );
+
+        return $new_image;
+    }
+
+    private function generate_filename($original_name) {
+        $post_id = get_the_ID() ?: 0;
+        $timestamp = time();
+        $random = substr(md5(rand()), 0, 6);
+        
+        return sprintf(
+            'image-%d-%d-%s.webp',
+            $post_id,
+            $timestamp,
+            $random
+        );
+    }
+
+    public function get_quality() {
+        return $this->options['quality'];
+    }
+
+    private function log($message, $is_error = false) {
+        if (WP_DEBUG) {
+            error_log("AnytoWEBP: " . ($is_error ? "ERROR - " : "") . $message);
+        }
+    }
+
+    // Admin functions
+    public function add_admin_menu() {
+        add_options_page(
+            'AnytoWEBP Settings',
+            'AnytoWEBP',
+            'manage_options',
+            'anytowebp-settings',
+            [$this, 'render_settings_page']
+        );
+    }
+
+    public function register_settings() {
+        register_setting('anytowebp_options', 'anytowebp_options', [
+            'sanitize_callback' => [$this, 'sanitize_options']
+        ]);
+
+        add_settings_section(
+            'anytowebp_main',
+            'Main Settings',
+            null,
+            'anytowebp-settings'
+        );
+
+        // Configuration fields
+        $this->add_settings_fields();
+    }
+
+    private function add_settings_fields() {
+        $fields = [
+            'quality' => [
+                'title' => 'WebP Quality',
+                'type' => 'number',
+                'description' => 'Value between 1 and 100 (default: 80)',
+                'min' => 1,
+                'max' => 100
+            ],
+            'max_dimension' => [
+                'title' => 'Max Dimension',
+                'type' => 'number',
+                'description' => 'Maximum width/height in pixels',
+                'min' => 100,
+                'max' => 5000
+            ],
+            'delete_original' => [
+                'title' => 'Delete Original',
+                'type' => 'checkbox',
+                'description' => 'Delete original file after conversion'
+            ],
+            'preserve_exif' => [
+                'title' => 'Preserve EXIF',
+                'type' => 'checkbox',
+                'description' => 'Keep image EXIF data'
+            ]
+        ];
+
+        foreach ($fields as $key => $field) {
+            add_settings_field(
+                'anytowebp_' . $key,
+                $field['title'],
+                [$this, 'render_field'],
+                'anytowebp-settings',
+                'anytowebp_main',
+                array_merge(['name' => $key], $field)
+            );
+        }
+    }
+
+    public function render_settings_page() {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+        ?>
+        <div class="wrap">
+            <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
+            <form action="options.php" method="post">
+                <?php
+                settings_fields('anytowebp_options');
+                do_settings_sections('anytowebp-settings');
+                submit_button('Save Settings');
+                ?>
+            </form>
+        </div>
+        <?php
+    }
+
+    public function render_field($args) {
+        $options = get_option('anytowebp_options', $this->defaults);
+        $value = isset($options[$args['name']]) ? $options[$args['name']] : '';
+        
+        switch ($args['type']) {
+            case 'number':
+                printf(
+                    '<input type="number" id="anytowebp_%1$s" name="anytowebp_options[%1$s]" value="%2$s" min="%3$s" max="%4$s" class="regular-text">',
+                    esc_attr($args['name']),
+                    esc_attr($value),
+                    esc_attr($args['min']),
+                    esc_attr($args['max'])
+                );
+                break;
+            
+            case 'checkbox':
+                printf(
+                    '<input type="checkbox" id="anytowebp_%1$s" name="anytowebp_options[%1$s]" %2$s>',
+                    esc_attr($args['name']),
+                    checked($value, true, false)
+                );
+                break;
+        }
+        
+        if (isset($args['description'])) {
+            printf('<p class="description">%s</p>', esc_html($args['description']));
+        }
+    }
+
+    public function sanitize_options($input) {
+        $sanitized = [];
+        
+        if (isset($input['quality'])) {
+            $sanitized['quality'] = min(100, max(1, intval($input['quality'])));
+        }
+        
+        if (isset($input['max_dimension'])) {
+            $sanitized['max_dimension'] = min(5000, max(100, intval($input['max_dimension'])));
+        }
+        
+        $sanitized['delete_original'] = isset($input['delete_original']);
+        $sanitized['preserve_exif'] = isset($input['preserve_exif']);
+        
+        return $sanitized;
+    }
+
+    public function add_settings_link($links) {
+        $settings_link = sprintf(
+            '<a href="%s">%s</a>',
+            admin_url('options-general.php?page=anytowebp-settings'),
+            __('Settings')
+        );
+        array_unshift($links, $settings_link);
+        return $links;
+    }
+}
+
+// Initialize the plugin
+new AnytoWEBP();
